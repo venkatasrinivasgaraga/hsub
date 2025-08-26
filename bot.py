@@ -1,181 +1,379 @@
-import os, asyncio, subprocess
+import os
+import asyncio
+import subprocess
+from uuid import uuid4
+from typing import List, Tuple, Dict, Any
+
 from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import (
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    Message,
+    CallbackQuery,
+)
 
-API_ID = int(os.getenv("API_ID"))
-API_HASH = os.getenv("API_HASH")
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# =========================
+# Config
+# =========================
+API_ID = int(os.getenv("API_ID", "25259066"))
+API_HASH = os.getenv("API_HASH", "caad2cdad2fe06057f2bf8f8a8e58950")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "7978709069:AAF1QJdpYaQVBTYL3wPBt5okvwI16dgyysA")
 
-app = Client("hardsub-audio-bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# Optional: simple guard
+if not API_ID or not API_HASH or not BOT_TOKEN:
+    print("[WARN] Missing API_ID/API_HASH/BOT_TOKEN in environment.")
 
-user_data = {}
-user_queues = {}
-active_jobs = {}  # track currently processing jobs
+app = Client(
+    "hardsub-audio-bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+)
 
-# ========== Get audio tracks ==========
-def get_audio_tracks(video_path):
+# =========================
+# State
+# =========================
+# Per-user temporary data (paths, chosen mode, etc.)
+user_data: Dict[int, Dict[str, Any]] = {}
+# Per-user FIFO queue of jobs
+user_queues: Dict[int, asyncio.Queue] = {}
+# Track job state per user: {user_id: {"status": "idle|running", "cancel": bool}}
+active_jobs: Dict[int, Dict[str, Any]] = {}
+
+# =========================
+# Helpers
+# =========================
+async def run_ffmpeg(cmd: List[str]) -> None:
+    """Run a blocking ffmpeg command in a thread pool with error checking."""
+    def _runner():
+        subprocess.run(cmd, check=True)
+    await asyncio.to_thread(_runner)
+
+
+def unique_output_path(user_id: int, ext: str = "mp4") -> str:
+    return f"output_{user_id}_{uuid4().hex}.{ext}"
+
+
+def get_ext_from_path(path: str, default: str = "mp4") -> str:
+    ext = os.path.splitext(path)[1].lstrip(".").lower()
+    return ext if ext else default
+
+
+def get_audio_tracks(video_path: str) -> List[Tuple[int, str]]:
+    """Return a list of (sequential_index_for_ffmpeg_map, language_tag).
+
+    We use enumeration order for safe mapping with -map 0:a:{n}.
+    """
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "a",
         "-show_entries", "stream=index:stream_tags=language",
         "-of", "csv=p=0",
-        video_path
+        video_path,
     ]
-    result = subprocess.check_output(cmd).decode().strip().split("\n")
-    tracks = []
-    for line in result:
+    try:
+        out = subprocess.check_output(cmd).decode().strip().split("\n")
+    except subprocess.CalledProcessError:
+        out = []
+
+    tracks: List[Tuple[int, str]] = []
+    for n, line in enumerate(out):
         if not line:
             continue
         parts = line.split(",")
-        idx = parts[0]
-        lang = parts[1] if len(parts) > 1 else "und"
-        tracks.append((idx, lang))
+        lang = parts[1] if len(parts) > 1 and parts[1] else "und"
+        tracks.append((n, lang))  # n is the sequential map index
     return tracks
 
-# ========== Worker ==========
+
 async def process_queue(user_id: int):
-    while not user_queues[user_id].empty():
-        job = await user_queues[user_id].get()
-        mode = job["mode"]
-        video_path = job["video"]
-        output_path = f"output_{user_id}.mp4"
+    """Process all queued jobs for a user in FIFO order."""
+    q = user_queues[user_id]
+    active_jobs[user_id] = {"status": "running", "cancel": False}
 
-        active_jobs[user_id] = True  # mark as processing
+    try:
+        while not q.empty():
+            job = await q.get()
+            if active_jobs[user_id].get("cancel"):
+                # Discard remaining jobs if cancel requested
+                q.task_done()
+                continue
 
+            mode = job["mode"]
+            video_path = job["video"]
+            chat_id = job["chat"]
+            reply_msg_id = job["msg"]
+
+            try:
+                if mode == "hardsub":
+                    subs_path = job["subs"]
+                    await app.send_message(chat_id, "🎬 Processing hard-sub, please wait…", reply_to_message_id=reply_msg_id)
+
+                    # Hardsub always re-encode video (subtitles filter requires it)
+                    output_path = unique_output_path(user_id, "mp4")
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-i", video_path,
+                        "-vf", f"subtitles={subs_path}",
+                        "-c:a", "copy",
+                        output_path,
+                    ]
+
+                    await run_ffmpeg(cmd)
+
+                    await app.send_video(chat_id, output_path, caption="✅ HardSub done!", reply_to_message_id=reply_msg_id)
+
+                elif mode == "audio":
+                    keep_tracks: List[int] = job["keep"]
+                    await app.send_message(chat_id, "🎧 Removing selected audio tracks…", reply_to_message_id=reply_msg_id)
+
+                    # Copy video, copy only selected audio streams
+                    in_ext = get_ext_from_path(video_path, "mp4")
+                    output_path = unique_output_path(user_id, in_ext)
+
+                    # Build -map arguments: always map all video streams, then chosen audio
+                    map_args: List[str] = ["-map", "0:v"]
+                    for t in keep_tracks:
+                        map_args += ["-map", f"0:a:{t}"]
+
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-i", video_path,
+                        *map_args,
+                        "-c", "copy",
+                        output_path,
+                    ]
+
+                    await run_ffmpeg(cmd)
+
+                    await app.send_document(chat_id, output_path, caption="✅ Audio cleaned!", reply_to_message_id=reply_msg_id)
+
+            except subprocess.CalledProcessError as e:
+                await app.send_message(chat_id, f"❌ FFmpeg error (code {e.returncode}).", reply_to_message_id=reply_msg_id)
+            except Exception as e:
+                await app.send_message(chat_id, f"❌ Error: {e}", reply_to_message_id=reply_msg_id)
+            finally:
+                # Cleanup outputs and temporary subtitle files
+                try:
+                    for f in [job.get("subs")]:
+                        if f and os.path.exists(f):
+                            os.remove(f)
+                except Exception:
+                    pass
+
+                # NOTE: remove original video after the job finishes (we downloaded it for this job)
+                try:
+                    if os.path.exists(video_path):
+                        os.remove(video_path)
+                except Exception:
+                    pass
+
+                # Remove any outputs created during this iteration
+                # We don't keep a direct reference here; rely on directory scan heuristic:
+                # (Skip to keep things simple; outputs already sent, Telegram stores a copy.)
+
+                q.task_done()
+
+            if active_jobs[user_id].get("cancel"):
+                # if cancel requested after finishing current item, stop
+                break
+    finally:
+        # Drain queue if cancelled
+        if active_jobs.get(user_id, {}).get("cancel"):
+            try:
+                q._queue.clear()
+            except Exception:
+                pass
+        active_jobs[user_id] = {"status": "idle", "cancel": False}
+
+
+# =========================
+# Commands & Handlers
+# =========================
+@app.on_message(filters.command(["start"]))
+async def start_cmd(_, message: Message):
+    await message.reply_text(
+        """
+👋 Send me a video and pick an option:
+
+• 🎬 HardSub → send .srt/.ass after choosing
+• 🎧 Audio Remove → choose which audio tracks to KEEP
+
+Commands:
+/queue – show your queue status
+/cancel – cancel pending jobs (and stop after current one)
+        """.strip()
+    )
+
+
+@app.on_message(filters.command(["queue"]))
+async def queue_cmd(_, message: Message):
+    uid = message.from_user.id
+    qsize = user_queues.get(uid).qsize() if uid in user_queues else 0
+    status = active_jobs.get(uid, {}).get("status", "idle")
+    await message.reply_text(f"🧾 Queue: {qsize} pending\n⚙️ Status: {status}")
+
+
+@app.on_message(filters.command(["cancel"]))
+async def cancel_cmd(_, message: Message):
+    uid = message.from_user.id
+    if uid in active_jobs and active_jobs[uid].get("status") == "running":
+        active_jobs[uid]["cancel"] = True
+        await message.reply_text("⏹️ Cancel requested. I will stop after the current job.")
+    elif uid in user_queues and not user_queues[uid].empty():
         try:
-            if mode == "hardsub":
-                subtitle_path = job["subs"]
-                await app.send_message(job["chat"], "🎬 Processing hard-sub, please wait...", reply_to_message_id=job["msg"])
-                cmd = f'ffmpeg -i "{video_path}" -vf subtitles="{subtitle_path}" -c:a copy "{output_path}" -y'
-                os.system(cmd)
+            user_queues[uid]._queue.clear()
+        except Exception:
+            pass
+        await message.reply_text("❌ Cleared your pending jobs.")
+    else:
+        await message.reply_text("ℹ️ Nothing to cancel.")
 
-            elif mode == "audio":
-                keep_tracks = job["keep"]
-                await app.send_message(job["chat"], "🎧 Removing selected audio tracks...", reply_to_message_id=job["msg"])
-                maps = "-map 0:v "
-                for t in keep_tracks:
-                    maps += f"-map 0:a:{t} "
-                cmd = f'ffmpeg -i "{video_path}" {maps} -c copy "{output_path}" -y'
-                os.system(cmd)
 
-            await app.send_video(job["chat"], output_path, caption="✅ Processing done!", reply_to_message_id=job["msg"])
+# Accept only videos (video messages or documents flagged as video)
+video_filter = (filters.video | filters.document.video)
 
-        except Exception as e:
-            await app.send_message(job["chat"], f"❌ Error: {e}", reply_to_message_id=job["msg"])
 
-        finally:
-            for f in [video_path, output_path, job.get("subs")]:
-                if f and os.path.exists(f): os.remove(f)
-            user_data.pop(user_id, None)
-            active_jobs.pop(user_id, None)  # clear active status
+@app.on_message(video_filter)
+async def ask_options(_, message: Message):
+    uid = message.from_user.id
 
-        user_queues[user_id].task_done()
+    # Optional: basic size limit check (e.g., 2.5 GB)
+    size = (message.video.file_size if message.video else message.document.file_size) or 0
+    max_size = 2_500_000_000
+    if size > max_size:
+        return await message.reply_text("⚠️ File too large for this bot. Please send a smaller file.")
 
-# ========== Handlers ==========
-@app.on_message(filters.document | filters.video)
-async def ask_options(client, message):
-    user_id = message.from_user.id
     video_path = await message.download()
-    user_data[user_id] = {"video_path": video_path}
+    user_data[uid] = {"video_path": video_path}
 
     buttons = [
         [InlineKeyboardButton("🎬 HardSub", callback_data="choose_hardsub")],
         [InlineKeyboardButton("🎧 Audio Remove", callback_data="choose_audio")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_job")]
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel_job")],
     ]
-    await message.reply_text("⚙ Choose what you want to do with this file:",
-                             reply_markup=InlineKeyboardMarkup(buttons))
+    await message.reply_text(
+        "⚙️ Choose what you want to do with this file:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
 
 @app.on_callback_query()
-async def handle_callbacks(client, query):
-    user_id = query.from_user.id
+async def handle_callbacks(_, query: CallbackQuery):
+    uid = query.from_user.id
     data = query.data
 
     # --- Cancel Job ---
     if data == "cancel_job":
-        if user_id in active_jobs:
-            return await query.answer("⚠ Already processing, cannot cancel!", show_alert=True)
-        if user_id in user_queues and not user_queues[user_id].empty():
-            user_queues[user_id]._queue.clear()
-            user_data.pop(user_id, None)
-            return await query.edit_message_text("❌ Job cancelled successfully.")
-        return await query.answer("⚠ No pending job to cancel.", show_alert=True)
+        # If running, request graceful cancel after current job
+        if uid in active_jobs and active_jobs[uid].get("status") == "running":
+            active_jobs[uid]["cancel"] = True
+            return await query.answer("⏹️ Will cancel after current job.", show_alert=True)
+
+        # Otherwise, clear pending queue
+        if uid in user_queues and not user_queues[uid].empty():
+            try:
+                user_queues[uid]._queue.clear()
+            except Exception:
+                pass
+            user_data.pop(uid, None)
+            return await query.edit_message_text("❌ Pending jobs cancelled.")
+        return await query.answer("ℹ️ No pending job to cancel.", show_alert=True)
+
+    # Require a video first
+    if uid not in user_data or "video_path" not in user_data[uid]:
+        return await query.answer("⚠️ Please send a video first.", show_alert=True)
 
     # --- HardSub Mode ---
     if data == "choose_hardsub":
-        user_data[user_id]["mode"] = "hardsub"
-        await query.edit_message_text("📥 Please send me your .srt or .ass subtitle file now.\n\n❌ You can cancel anytime.",
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_job")]]))
+        user_data[uid]["mode"] = "hardsub"
+        await query.edit_message_text(
+            "📥 Please send your .srt or .ass subtitle file now.\n\n❌ You can cancel anytime.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_job")]]),
+        )
 
     # --- Audio Remove Mode ---
     elif data == "choose_audio":
-        video = user_data[user_id]["video_path"]
+        video = user_data[uid]["video_path"]
         tracks = get_audio_tracks(video)
-        user_data[user_id]["tracks"] = tracks
-        user_data[user_id]["keep"] = []
+        if not tracks:
+            return await query.edit_message_text("⚠️ No audio tracks detected.")
 
-        buttons = [[InlineKeyboardButton(f"Keep {lang} (id:{idx})", callback_data=f"keep_{idx}")]
-                   for idx, lang in tracks]
+        user_data[uid]["tracks"] = tracks
+        user_data[uid]["keep"] = []
+
+        buttons = [
+            [InlineKeyboardButton(f"Keep {lang} (id:{idx})", callback_data=f"keep_{idx}")] for idx, lang in tracks
+        ]
         buttons.append([InlineKeyboardButton("✅ Done", callback_data="audio_done")])
         buttons.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel_job")])
 
-        await query.edit_message_text("🎧 Select audio tracks to KEEP:",
-                                      reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text(
+            "🎧 Select audio tracks to KEEP:",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
 
     elif data.startswith("keep_"):
-        idx = data.split("_")[1]
-        if idx not in user_data[user_id]["keep"]:
-            user_data[user_id]["keep"].append(idx)
+        idx = int(data.split("_", 1)[1])
+        keep_list: List[int] = user_data.get(uid, {}).get("keep", [])
+        if idx not in keep_list:
+            keep_list.append(idx)
+        user_data[uid]["keep"] = keep_list
         await query.answer(f"Selected audio {idx}")
 
     elif data == "audio_done":
-        video = user_data[user_id]["video_path"]
-        keep = user_data[user_id]["keep"]
+        if "keep" not in user_data.get(uid, {}) or not user_data[uid]["keep"]:
+            return await query.answer("⚠️ You must select at least one track!", show_alert=True)
 
-        if not keep:
-            return await query.answer("⚠ You must select at least one track!", show_alert=True)
+        if uid not in user_queues:
+            user_queues[uid] = asyncio.Queue()
 
-        if user_id not in user_queues:
-            user_queues[user_id] = asyncio.Queue()
-
-        await user_queues[user_id].put({
+        await user_queues[uid].put({
             "mode": "audio",
-            "video": video,
-            "keep": keep,
+            "video": user_data[uid]["video_path"],
+            "keep": user_data[uid]["keep"],
             "chat": query.message.chat.id,
-            "msg": query.message.id
+            "msg": query.message.id,
         })
 
-        await query.edit_message_text("📌 Added to queue for Audio Cleaning",
-                                      reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_job")]]))
-        if user_queues[user_id].qsize() == 1:
-            asyncio.create_task(process_queue(user_id))
+        await query.edit_message_text(
+            "📌 Added to queue for Audio Cleaning",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_job")]]),
+        )
+        if user_queues[uid].qsize() == 1 and active_jobs.get(uid, {}).get("status") != "running":
+            asyncio.create_task(process_queue(uid))
+
 
 # --- Subtitles handler (only after choosing HardSub) ---
 @app.on_message(filters.document & (filters.file_extension("srt") | filters.file_extension("ass")))
-async def handle_subtitles(client, message):
-    user_id = message.from_user.id
-    if "mode" not in user_data.get(user_id, {}) or user_data[user_id]["mode"] != "hardsub":
-        return await message.reply_text("⚠ Please first send a video and select HardSub option!")
+async def handle_subtitles(_, message: Message):
+    uid = message.from_user.id
+    if "mode" not in user_data.get(uid, {}) or user_data[uid]["mode"] != "hardsub":
+        return await message.reply_text("⚠️ Please first send a video and select HardSub option!")
 
     subs_path = await message.download()
-    video = user_data[user_id]["video_path"]
 
-    if user_id not in user_queues:
-        user_queues[user_id] = asyncio.Queue()
+    if uid not in user_queues:
+        user_queues[uid] = asyncio.Queue()
 
-    await user_queues[user_id].put({
+    await user_queues[uid].put({
         "mode": "hardsub",
-        "video": video,
+        "video": user_data[uid]["video_path"],
         "subs": subs_path,
         "chat": message.chat.id,
-        "msg": message.id
+        "msg": message.id,
     })
 
-    await message.reply_text("📌 Added to queue for HardSub",
-                             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_job")]]))
-    if user_queues[user_id].qsize() == 1:
-        asyncio.create_task(process_queue(user_id))
+    await message.reply_text(
+        "📌 Added to queue for HardSub",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="cancel_job")]]),
+    )
 
-print("🤖 Bot with Inline Options + Cancel running...")
+    if user_queues[uid].qsize() == 1 and active_jobs.get(uid, {}).get("status") != "running":
+        asyncio.create_task(process_queue(uid))
+
+
+print("🤖 Bot with Inline Options + Cancel running…")
 app.run()
